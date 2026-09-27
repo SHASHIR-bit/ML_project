@@ -29,14 +29,13 @@ import warnings; warnings.filterwarnings('ignore')
 # ─── Auto-detect data path ───────────────────────────────────────────────────
 INPUT_ROOT = Path("/kaggle/input")
 DATA_DIR = None
-for d in INPUT_ROOT.iterdir():
-    if (d / "train_s1.parquet").exists():
-        DATA_DIR = d; break
-if DATA_DIR is None:
-    for name in ["er-challenge-data", "ml-challenge-er", "entity-resolution"]:
-        if (INPUT_ROOT / name / "train_s1.parquet").exists():
-            DATA_DIR = INPUT_ROOT / name; break
-assert DATA_DIR is not None, f"Cannot find parquet files in {INPUT_ROOT}. Check dataset name."
+
+# Recursively search for the data since Kaggle sometimes nests uploaded folders
+for path in INPUT_ROOT.rglob("train_s1.parquet"):
+    DATA_DIR = path.parent
+    break
+
+assert DATA_DIR is not None, f"Cannot find train_s1.parquet anywhere in {INPUT_ROOT}. Make sure your Kaggle Dataset is attached to this notebook."
 OUT = Path("/kaggle/working"); OUT.mkdir(exist_ok=True)
 print(f"✅ Data directory: {DATA_DIR}")
 
