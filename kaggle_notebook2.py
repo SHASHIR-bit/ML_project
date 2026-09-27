@@ -148,7 +148,7 @@ def tfidf_block(s1_df, sx_df, col="name_exp", top_k=TFIDF_TOP_K):
             s1_v = normalize(tfidf.transform(s1_vals), norm='l2')
         except ValueError: continue 
         
-        BS = 5000
+        BS = 500  # Reduced to prevent Out-Of-Memory crashes
         for st in range(0, len(s1_ids), BS):
             en = min(st+BS, len(s1_ids))
             sim = (s1_v[st:en] @ sx_v.T).tocsr()
@@ -160,6 +160,7 @@ def tfidf_block(s1_df, sx_df, col="name_exp", top_k=TFIDF_TOP_K):
                     sel = row.indices[tk]
                 else: sel = row.indices
                 cands[s1_ids[st+i]].update(sx_ids[sel])
+            del sim; gc.collect()
         del sx_v, s1_v, tfidf; gc.collect()
     return cands
 
