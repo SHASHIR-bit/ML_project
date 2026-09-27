@@ -21,14 +21,7 @@ venv.bak/
 __MACOSX/
 Thumbs.db
 
-# Datasets and Large Archives (>100MB rejected by GitHub)
-*.zip
-*.tar.gz
-dataset/
-output/
-*.tsv
-*.csv
-*.parquet
+
 
 # ML model weights and checkpoints
 models/
