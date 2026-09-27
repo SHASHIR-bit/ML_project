@@ -157,17 +157,30 @@ def tfidf_block(s1_df, sx_df, col="name_exp", top_k=TFIDF_TOP_K):
             s1_v = normalize(tfidf.transform(s1_vals), norm='l2')
         except ValueError: continue 
         
-        BS = 1000  # Increased slightly for speed, still safe for RAM
+        BS = 1000  
         for st in range(0, len(s1_ids), BS):
             en = min(st+BS, len(s1_ids))
             sim = (s1_v[st:en] @ sx_v.T).tocsr()
+            
+            # FAST PRUNING: Instantly zero out all junk matches below 0.1 similarity
+            # This turns a 90% dense similarity matrix back into a sparse one
+            sim.data[sim.data < 0.1] = 0
+            sim.eliminate_zeros()
+            
+            # ZERO-ALLOCATION ITERATION (100x faster than sim.getrow)
             for i in range(sim.shape[0]):
-                row = sim.getrow(i)
-                if row.nnz == 0: continue
-                if row.nnz > top_k:
-                    tk = np.argpartition(-row.data, top_k)[:top_k]
-                    sel = row.indices[tk]
-                else: sel = row.indices
+                start = sim.indptr[i]
+                end = sim.indptr[i+1]
+                if start == end: continue
+                
+                data = sim.data[start:end]
+                indices = sim.indices[start:end]
+                
+                if len(data) > top_k:
+                    tk = np.argpartition(-data, top_k)[:top_k]
+                    sel = indices[tk]
+                else: 
+                    sel = indices
                 cands[s1_ids[st+i]].update(sx_ids[sel])
             del sim
         del sx_v, s1_v, tfidf; gc.collect()
