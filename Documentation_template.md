@@ -1,74 +1,32 @@
-# ML Challenge 2026: Business Entity Resolution Solution Template
+# Entity Resolution Methodology
+Team Name: Vector Strike
 
-**Team Name:** [Your Team Name]  
-**Team Members:** [List all team members]  
-**Submission Date:** [Date]
+## 1. Preprocessing
+We utilized PyArrow string compute functions (C++ backend) directly on Pandas dataframes to normalize 40 million business names and addresses in under 2 minutes. Our normalization included:
+- Lowercasing and whitespace trimming
+- Punctuation removal (Regex `[^a-z0-9\s]`)
+- Prefix extraction (first 5 characters) and First Word extraction
+- Pincode extraction from address (`\b\d{5,6}\b`)
 
----
+## 2. Blocking (Candidate Generation)
+To reduce 22 trillion possible comparisons, we applied a multi-strategy O(N) inverted-index blocking approach partitioned by Country:
+1. Exact Name Prefix (first 5 chars) match
+2. Exact First Word match
+3. Exact Pincode match
+4. Rare Token match (tokens with frequency < 300)
 
-## 1. Executive Summary
-*Provide a brief 2-3 sentence overview of your approach and key innovations.*
+We capped maximum candidates per entity to 100 to maintain strict 16GB memory limits.
 
----
+## 3. Feature Engineering
+For each candidate pair, we computed 27 distinct similarity features including:
+- Jaccard similarity of name/address tokens
+- Character n-gram overlaps (2, 3, 4 grams)
+- Token length ratios and exact matches
+- Levenshtein distance proxies
 
-## 2. Methodology
-
-### 2.1 Problem Analysis
-*Key insights discovered during EDA — noise patterns, address variations, missing fields, etc.*
-
-### 2.2 Solution Strategy
-*Outline your high-level approach.*
-
-**Approach Type:** [Blocking + Classifier / End-to-End / Graph-Based / Hybrid, etc]  
-**Core Innovation:** [Brief description of your main technical contribution]
-
----
-
-## 3. Candidate Generation (Blocking)
-*Describe how you reduced the comparison space to a manageable candidate set.*
-
-- **Blocking keys used:** [e.g., PIN code, phonetic name encoding, TF-IDF, etc.]
-- **Candidate pairs generated:** [total]
-- **How you ensured true matches were not lost:**
-
----
-
-## 4. Matching Model
-
-**Features used:**
-- Name features: [e.g., Jaccard, Levenshtein, phonetic encoding]
-- Address features: [e.g., token overlap, edit distance, PIN code matching]
-- Other: []
-
-**Model type:** [e.g., XGBoost, Siamese Network, Transformer, etc.]  
-**Threshold selection method:** [e.g., F_0.5 optimization on validation set]
-
----
-
-## 5. Results & Error Analysis
-
-- **F_0.5 Score (macro):** [your best validation score]
-- **Common false positives (wrong merges):** [brief description]
-- **Common false negatives (missed matches):** [brief description]
-
----
-
-## 6. Conclusion
-*Summarize your approach, key achievements, and lessons learned in 2-3 sentences.*
-
----
-
-## Appendix
-
-### A. Code Artefacts
-*Your complete, runnable code ships in the submission zip under
-`code/business_entity_resolution/` (all source in `src/`, with a `README.md` and
-`requirements.txt`). Summarise its structure and the entry point(s) to reproduce
-`output/matching_results.tsv` and `output/candidate_pairs.tsv` here.*
-
-### B. Additional Results
-*Include any additional charts, graphs, or detailed results.*
-
----
-
-**Note:** Teams can modify sections according to their approach while maintaining clarity and technical depth.
+## 4. Modeling
+We trained a LightGBM Binary Classifier on the 10 million candidate pairs using an NVIDIA RTX 4050 GPU. 
+- Objective: `binary_logloss`
+- Max Depth: 8, Num Leaves: 63
+- To maximize the precision-heavy F_0.5 metric, we applied `scale_pos_weight` during training to combat class imbalance, and ran a grid search on the validation set to dynamically select the optimal probability threshold (0.65). 
+- Singletons are gracefully handled if no candidate exceeds the threshold.

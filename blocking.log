@@ -1,0 +1,20 @@
+================================================================================
+STEP 3: BLOCKING / CANDIDATE GENERATION
+================================================================================
+
+================================================================================
+BLOCKING: TRAIN
+================================================================================
+
+  Loading train S1...
+  S1: 2,206,821 entities
+
+  Loading train S2...
+  S2: 5,034,616 entities
+
+  --- Country: india ---
+    S1: 883,188 | S2: 2,017,799
+    [prefix_india] 531,407 S1 with candidates, 57,783,125 pairs, 338418 skipped
+    [firstword_india] 448,531 S1 with candidates, 36,358,674 pairs, 433583 skipped
+    [pincode_india] 2,086 S1 with candidates, 8,964 pairs, 0 skipped
+    Inverted index: 286,500 rare tokens, avg posting size: 4.7

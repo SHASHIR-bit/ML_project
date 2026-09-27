@@ -1,0 +1,68 @@
+================================================================================
+ML CHALLENGE 2026: ENTITY RESOLUTION PIPELINE
+================================================================================
+  Skipping step 1: Data Forensics (EDA)
+
+################################################################################
+# STEP 2: Text Preprocessing
+# Script: scripts/02_preprocess.py
+################################################################################
+
+================================================================================
+STEP 2: PREPROCESSING (PYARROW COMPUTE)
+================================================================================
+
+>>> Processing train_s1...
+  Loaded 2,206,821 rows in 2.9s
+  Normalized text in 8.3s
+  Extracted blocking keys in 7.1s
+  Saved to X:\ML_project\processed\train_s1.parquet (166.5 MB)
+  Total: 22.1s
+
+>>> Processing train_s2...
+  Loaded 5,034,616 rows in 8.9s
+  Normalized text in 21.1s
+  Extracted blocking keys in 17.9s
+  Saved to X:\ML_project\processed\train_s2.parquet (393.7 MB)
+  Total: 59.2s
+
+>>> Processing train_s3...
+  Loaded 5,285,603 rows in 8.2s
+  Normalized text in 21.6s
+  Extracted blocking keys in 17.5s
+  Saved to X:\ML_project\processed\train_s3.parquet (419.1 MB)
+  Total: 56.3s
+
+>>> Processing test_s1...
+  Loaded 1,732,544 rows in 2.5s
+  Normalized text in 7.1s
+  Extracted blocking keys in 5.9s
+  Saved to X:\ML_project\processed\test_s1.parquet (136.1 MB)
+  Total: 18.4s
+
+>>> Processing test_s2...
+  Loaded 4,887,273 rows in 8.1s
+  Normalized text in 21.4s
+  Extracted blocking keys in 16.6s
+  Saved to X:\ML_project\processed\test_s2.parquet (392.7 MB)
+  Total: 58.0s
+
+>>> Processing test_s3...
+  Loaded 5,082,316 rows in 33.1s
+  Normalized text in 82.5s
+  Extracted blocking keys in 37.2s
+  Saved to X:\ML_project\processed\test_s3.parquet (410.8 MB)
+  Total: 161.4s
+
+>>> Saving ground truth...
+  Saved 2,206,821 rows
+
+>>> PREPROCESSING COMPLETE in 387.1s
+
+>>> Step 2 completed in 387.8s
+
+################################################################################
+# STEP 3: Blocking / Candidate Generation
+# Script: scripts/03_blocking.py
+################################################################################
+
