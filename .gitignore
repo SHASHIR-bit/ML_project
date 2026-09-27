@@ -1,0 +1,41 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE / Editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+__MACOSX/
+Thumbs.db
+
+# Datasets and Large Archives (>100MB rejected by GitHub)
+*.zip
+*.tar.gz
+dataset/
+output/
+*.tsv
+*.csv
+*.parquet
+
+# ML model weights and checkpoints
+models/
+checkpoints/
+*.pth
+*.pt
+*.onnx
+*.bin
+*.pkl
+*.h5
