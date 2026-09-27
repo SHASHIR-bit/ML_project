@@ -5,15 +5,16 @@ Paste this entire script into a single Kaggle notebook cell.
 Requires: dataset "er-challenge-data" added to notebook.
 Runtime: ~80-100 minutes on Kaggle GPU/CPU.
 Changes for 0.99+:
-- Ensembled LightGBM + XGBoost + CatBoost
+- Ensembled LightGBM + XGBoost
 - Expanded candidate blocking limits (TF-IDF Top-K 100, Max Cands 500)
 - Added address-based TF-IDF blocking
 - Added word-level TF-IDF similarity features
 - Added token_sort_ratio and token_set_ratio features
 - Optimized threshold finding mechanism
+- [NEW] Bulletproofed against missing columns, empty vocabularies, and OOMs.
 """
 import subprocess, sys
-subprocess.run([sys.executable, "-m", "pip", "install", "rapidfuzz", "catboost", "xgboost", "-q"], check=True)
+subprocess.run([sys.executable, "-m", "pip", "install", "rapidfuzz", "xgboost", "-q"], check=True)
 
 import pandas as pd, numpy as np, gc, time, os, re, json
 from pathlib import Path
@@ -24,7 +25,6 @@ from sklearn.model_selection import GroupKFold
 from scipy.sparse import csr_matrix
 import lightgbm as lgb
 import xgboost as xgb
-from catboost import CatBoostClassifier, Pool
 from rapidfuzz.distance import JaroWinkler, Levenshtein as RFLevenshtein
 from rapidfuzz.fuzz import token_sort_ratio, token_set_ratio
 import warnings; warnings.filterwarnings('ignore')
@@ -33,7 +33,6 @@ import warnings; warnings.filterwarnings('ignore')
 INPUT_ROOT = Path("/kaggle/input")
 DATA_DIR = None
 
-# Recursively search for the data since Kaggle sometimes nests uploaded folders
 for path in INPUT_ROOT.rglob("train_s1.parquet"):
     DATA_DIR = path.parent
     break
@@ -43,7 +42,7 @@ OUT = Path("/kaggle/working"); OUT.mkdir(exist_ok=True)
 print(f"✅ Data directory: {DATA_DIR}")
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-TFIDF_TOP_K = 100       # Increased for ~100% blocking recall
+TFIDF_TOP_K = 100
 MAX_BLOCK_SIZE = 8000
 MAX_CANDIDATES = 500
 NEG_RATIO = 12
@@ -66,15 +65,15 @@ ABBREVS = {
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 def clean(name):
-    if not name: return ""
+    if not name or not isinstance(name, str): return ""
     return " ".join(t for t in name.split() if t not in SUFFIXES)
 
 def expand(name):
-    if not name: return ""
+    if not name or not isinstance(name, str): return ""
     return " ".join(ABBREVS.get(t, t) for t in name.split())
 
 def ngram_set(s, n=3):
-    if not s or len(s) < n: return frozenset()
+    if not s or not isinstance(s, str) or len(s) < n: return frozenset()
     return frozenset(s[i:i+n] for i in range(len(s)-n+1))
 
 def jaccard(a, b):
@@ -117,10 +116,18 @@ for _, r in train_gt.iterrows():
     gt_dict[s1] = set() if pd.isna(m) or str(m).strip()=="" else set(x.strip() for x in str(m).split(",") if x.strip())
 del train_gt; gc.collect()
 
-# Add expanded/clean names
+# Add expanded/clean names and handle missing columns safely
 for df in [train_s1, train_s2, train_s3, test_s1, test_s2, test_s3]:
-    df["name_norm"] = df["name_norm"].fillna("")
-    df["addr_norm"] = df["addr_norm"].fillna("")
+    for col in ["name_norm", "addr_norm", "country_lower", "pincode", "first_word"]:
+        if col not in df.columns:
+            df[col] = ""
+    
+    df["name_norm"] = df["name_norm"].fillna("").astype(str)
+    df["addr_norm"] = df["addr_norm"].fillna("").astype(str)
+    df["country_lower"] = df["country_lower"].fillna("").astype(str)
+    df["pincode"] = df["pincode"].fillna("").astype(str)
+    df["first_word"] = df["first_word"].fillna("").astype(str)
+    
     df["name_exp"]  = df["name_norm"].apply(expand)
     df["name_cln"]  = df["name_norm"].apply(clean)
 
@@ -132,7 +139,6 @@ print(f"Loaded in {time.time()-t0:.1f}s\n")
 print("="*80); print("SECTION 2: BLOCKING"); print("="*80)
 
 def tfidf_block(s1_df, sx_df, col="name_exp", top_k=TFIDF_TOP_K):
-    """TF-IDF blocking per country."""
     cands = defaultdict(set)
     countries = sorted(set(s1_df["country_lower"].unique()) | set(sx_df["country_lower"].unique()))
     for country in countries:
@@ -140,7 +146,6 @@ def tfidf_block(s1_df, sx_df, col="name_exp", top_k=TFIDF_TOP_K):
         sxc = sx_df[sx_df["country_lower"]==country]
         if len(s1c)==0 or len(sxc)==0: continue
         
-        # Fill empty with 'unknown' for vectorizer
         sx_vals = sxc[col].replace("", "unknown").values
         s1_vals = s1c[col].replace("", "unknown").values
         
@@ -150,9 +155,9 @@ def tfidf_block(s1_df, sx_df, col="name_exp", top_k=TFIDF_TOP_K):
         try:
             sx_v = normalize(tfidf.fit_transform(sx_vals), norm='l2')
             s1_v = normalize(tfidf.transform(s1_vals), norm='l2')
-        except ValueError: continue # empty vocabulary
+        except ValueError: continue 
         
-        BS = 500  # Reduced to prevent Out-Of-Memory crashes
+        BS = 500  # Micro-chunks to prevent OOM
         for st in range(0, len(s1_ids), BS):
             en = min(st+BS, len(s1_ids))
             sim = (s1_v[st:en] @ sx_v.T).tocsr()
@@ -169,7 +174,6 @@ def tfidf_block(s1_df, sx_df, col="name_exp", top_k=TFIDF_TOP_K):
     return cands
 
 def trad_block(s1_df, sx_df):
-    """Traditional blocking: prefix, firstword, pincode, clean_prefix, rare tokens."""
     cands = defaultdict(set)
     countries = sorted(set(s1_df["country_lower"].unique()) | set(sx_df["country_lower"].unique()))
     for country in countries:
@@ -177,7 +181,6 @@ def trad_block(s1_df, sx_df):
         sxc = sx_df[sx_df["country_lower"]==country]
         if len(s1c)==0 or len(sxc)==0: continue
         s1_ids = s1c["entity_id"].values; sx_ids = sxc["entity_id"].values
-        # Key-based blocking
         for col in ["bk_prefix_country","bk_firstword_country","bk_pincode_country"]:
             if col not in sxc.columns: continue
             idx = defaultdict(list)
@@ -187,7 +190,6 @@ def trad_block(s1_df, sx_df):
                 if k and isinstance(k,str) and "|" in k and k.split("|")[0]:
                     m = idx.get(k,[])
                     if 0<len(m)<=MAX_BLOCK_SIZE: cands[s1id].update(m)
-        # Clean-name prefix blocking
         s1_cpk = s1c["name_cln"].str.replace(" ","",regex=False).str[:5]+"|"+country
         sx_cpk = sxc["name_cln"].str.replace(" ","",regex=False).str[:5]+"|"+country
         idx = defaultdict(list)
@@ -197,7 +199,6 @@ def trad_block(s1_df, sx_df):
             if k and k.split("|")[0]:
                 m = idx.get(k,[])
                 if 0<len(m)<=MAX_BLOCK_SIZE: cands[s1id].update(m)
-        # Rare token inverted index
         sx_names = sxc["name_norm"].values
         freq = Counter()
         for nm in sx_names:
@@ -231,7 +232,7 @@ def run_blocking(s1_df, s2_df, s3_df, label="train"):
         del c1; gc.collect()
         
         print(f"  [{sx_nm}] TF-IDF Address blocking...")
-        ca = tfidf_block(s1_df, sx_df, col="addr_norm", top_k=TFIDF_TOP_K//2)
+        ca = tfidf_block(s1_df, sx_df, col="addr_norm", top_k=max(TFIDF_TOP_K//2, 10))
         for k,v in ca.items(): all_cands[k].update(v)
         del ca; gc.collect()
 
@@ -240,10 +241,8 @@ def run_blocking(s1_df, s2_df, s3_df, label="train"):
         for k,v in c2.items(): all_cands[k].update(v)
         del c2; gc.collect()
         
-    # Ensure all S1 present
     for eid in s1_df["entity_id"]: 
         if eid not in all_cands: all_cands[eid]=set()
-    # Cap
     capped=0
     for k in all_cands:
         if len(all_cands[k])>MAX_CANDIDATES:
@@ -270,8 +269,13 @@ print(f"\n  🎯 BLOCKING RECALL: {recall:.4f} ({found:,}/{total_true:,})")
 # ══════════════════════════════════════════════════════════════════════════════
 print("\n"+"="*80); print("SECTION 3: TF-IDF FEATURE MATRICES"); print("="*80)
 
+def safe_tfidf(tfidf, texts):
+    try:
+        return normalize(tfidf.fit_transform(texts), norm='l2')
+    except ValueError:
+        return csr_matrix((len(texts), 1), dtype=np.float32)
+
 def build_tfidf_index(s1_df, s2_df, s3_df):
-    """Build global TF-IDF matrices for cosine similarity features."""
     t0 = time.time()
     all_names = np.concatenate([s1_df["name_exp"].values, s2_df["name_exp"].values, s3_df["name_exp"].values])
     all_addrs = np.concatenate([s1_df["addr_norm"].values, s2_df["addr_norm"].values, s3_df["addr_norm"].values])
@@ -281,18 +285,17 @@ def build_tfidf_index(s1_df, s2_df, s3_df):
     print("  Building name char TF-IDF...")
     name_tfidf = TfidfVectorizer(analyzer='char_wb', ngram_range=(3,4), max_features=80000,
                                   sublinear_tf=True, dtype=np.float32)
-    name_mat = normalize(name_tfidf.fit_transform(all_names), norm='l2')
+    name_mat = safe_tfidf(name_tfidf, all_names)
     
     print("  Building name word TF-IDF...")
     name_word_tfidf = TfidfVectorizer(analyzer='word', ngram_range=(1,2), max_features=50000,
                                       sublinear_tf=True, dtype=np.float32)
-    name_w_mat = normalize(name_word_tfidf.fit_transform(all_names), norm='l2')
+    name_w_mat = safe_tfidf(name_word_tfidf, all_names)
     
     print("  Building addr char TF-IDF...")
     addr_tfidf = TfidfVectorizer(analyzer='char_wb', ngram_range=(3,4), max_features=50000,
                                   sublinear_tf=True, dtype=np.float32)
-    addr_mat = normalize(addr_tfidf.fit_transform(all_addrs), norm='l2')
-    print(f"  Built in {time.time()-t0:.1f}s")
+    addr_mat = safe_tfidf(addr_tfidf, all_addrs)
     
     del all_names, all_addrs, all_ids, name_tfidf, name_word_tfidf, addr_tfidf; gc.collect()
     return name_mat, name_w_mat, addr_mat, eid2idx
@@ -305,21 +308,16 @@ train_name_mat, train_name_w_mat, train_addr_mat, train_eid2idx = build_tfidf_in
 print("\n"+"="*80); print("SECTION 4: FEATURE ENGINEERING (TRAIN)"); print("="*80)
 
 def build_entity_lookup(df):
-    """Build fast entity lookup dict."""
     lookup = {}
     eids = df["entity_id"].values
     norms = df["name_norm"].values; addrs = df["addr_norm"].values
-    pins = df["pincode"].fillna("").values; fws = df["first_word"].fillna("").values
+    pins = df["pincode"].values; fws = df["first_word"].values
     exps = df["name_exp"].values; clns = df["name_cln"].values
     for i in range(len(df)):
-        nm = norms[i] if isinstance(norms[i],str) else ""
-        ad = addrs[i] if isinstance(addrs[i],str) else ""
-        ex = exps[i] if isinstance(exps[i],str) else ""
-        cl = clns[i] if isinstance(clns[i],str) else ""
+        nm = str(norms[i]); ad = str(addrs[i]); ex = str(exps[i]); cl = str(clns[i])
         lookup[eids[i]] = {
-            "name": nm, "addr": ad, "pin": pins[i] if isinstance(pins[i],str) else "",
-            "fw": fws[i] if isinstance(fws[i],str) else "",
-            "exp": ex, "cln": cl, "eid": eids[i],
+            "name": nm, "addr": ad, "pin": str(pins[i]),
+            "fw": str(fws[i]), "exp": ex, "cln": cl, "eid": eids[i],
             "ntok": frozenset(nm.split()) if nm else frozenset(),
             "atok": frozenset(ad.split()) if ad else frozenset(),
             "ctok": frozenset(cl.split()) if cl else frozenset(),
@@ -327,7 +325,6 @@ def build_entity_lookup(df):
     return lookup
 
 def compute_features(s1_ids, sx_ids, s1_lk, sx_lk, name_mat, name_w_mat, addr_mat, eid2idx):
-    """Compute features for candidate pairs. Returns DataFrame."""
     n = len(s1_ids)
     feats = {k: np.zeros(n, dtype=np.float32) for k in [
         "name_tfidf", "name_w_tfidf", "addr_tfidf","name_jw","name_lev","addr_jw",
@@ -340,20 +337,18 @@ def compute_features(s1_ids, sx_ids, s1_lk, sx_lk, name_mat, name_w_mat, addr_ma
         "cln_jaccard","cln_exact","exp_jw", "name_token_sort", "name_token_set"
     ]}
     
-    # ── Vectorized TF-IDF cosine ──
     s1_idx = np.array([eid2idx[eid] for eid in s1_ids])
     sx_idx = np.array([eid2idx[eid] for eid in sx_ids])
-    feats["name_tfidf"] = np.array(name_mat[s1_idx].multiply(name_mat[sx_idx]).sum(axis=1)).flatten()
-    feats["name_w_tfidf"] = np.array(name_w_mat[s1_idx].multiply(name_w_mat[sx_idx]).sum(axis=1)).flatten()
-    feats["addr_tfidf"] = np.array(addr_mat[s1_idx].multiply(addr_mat[sx_idx]).sum(axis=1)).flatten()
     
-    # ── Loop-based features ──
+    if name_mat.shape[1] > 1: feats["name_tfidf"] = np.array(name_mat[s1_idx].multiply(name_mat[sx_idx]).sum(axis=1)).flatten()
+    if name_w_mat.shape[1] > 1: feats["name_w_tfidf"] = np.array(name_w_mat[s1_idx].multiply(name_w_mat[sx_idx]).sum(axis=1)).flatten()
+    if addr_mat.shape[1] > 1: feats["addr_tfidf"] = np.array(addr_mat[s1_idx].multiply(addr_mat[sx_idx]).sum(axis=1)).flatten()
+    
     for i in range(n):
         s1 = s1_lk[s1_ids[i]]; sx = sx_lk[sx_ids[i]]
         n1=s1["name"]; n2=sx["name"]; a1=s1["addr"]; a2=sx["addr"]
         e1=s1["exp"]; e2=sx["exp"]; c1=s1["cln"]; c2=sx["cln"]
         
-        # Rapidfuzz string distances
         feats["name_jw"][i] = JaroWinkler.similarity(n1,n2) if n1 and n2 else (1.0 if n1==n2 else 0.0)
         feats["name_lev"][i] = RFLevenshtein.normalized_similarity(n1,n2) if n1 and n2 else (1.0 if n1==n2 else 0.0)
         feats["addr_jw"][i] = JaroWinkler.similarity(a1,a2) if a1 and a2 else (1.0 if a1==a2 else 0.0)
@@ -361,7 +356,6 @@ def compute_features(s1_ids, sx_ids, s1_lk, sx_lk, name_mat, name_w_mat, addr_ma
         feats["name_token_sort"][i] = token_sort_ratio(n1, n2) / 100.0 if n1 and n2 else 0.0
         feats["name_token_set"][i]  = token_set_ratio(n1, n2) / 100.0 if n1 and n2 else 0.0
         
-        # Token features
         nt1=s1["ntok"]; nt2=sx["ntok"]; at1=s1["atok"]; at2=sx["atok"]
         ct1=s1["ctok"]; ct2=sx["ctok"]
         feats["name_jaccard"][i] = jaccard(nt1,nt2)
@@ -373,12 +367,10 @@ def compute_features(s1_ids, sx_ids, s1_lk, sx_lk, name_mat, name_w_mat, addr_ma
         feats["cln_jaccard"][i] = jaccard(ct1,ct2)
         feats["cln_exact"][i] = 1.0 if c1==c2 and c1 else 0.0
         
-        # Char n-grams
         feats["name_c3g"][i] = jaccard(ngram_set(n1,3), ngram_set(n2,3))
         feats["name_c4g"][i] = jaccard(ngram_set(n1,4), ngram_set(n2,4))
         feats["addr_c3g"][i] = jaccard(ngram_set(a1,3), ngram_set(a2,3))
         
-        # Lengths
         ln1=len(n1); ln2=len(n2); la1=len(a1); la2=len(a2)
         feats["name_exact"][i] = 1.0 if n1==n2 and n1 else 0.0
         feats["name_len_ratio"][i] = min(ln1,ln2)/max(ln1,ln2) if max(ln1,ln2)>0 else 1.0
@@ -391,12 +383,10 @@ def compute_features(s1_ids, sx_ids, s1_lk, sx_lk, name_mat, name_w_mat, addr_ma
         feats["addr_exact"][i] = 1.0 if a1==a2 and a1 else 0.0
         feats["addr_len_ratio"][i] = min(la1,la2)/max(la1,la2) if max(la1,la2)>0 else 1.0
         
-        # Address numbers
         nums1 = frozenset(re.findall(r'\d+',a1)); nums2 = frozenset(re.findall(r'\d+',a2))
         if nums1 and nums2: feats["addr_num_ovlp"][i] = len(nums1&nums2)/len(nums1|nums2)
         elif not nums1 and not nums2: feats["addr_num_ovlp"][i] = 1.0
         
-        # Pincode
         p1=s1["pin"]; p2=sx["pin"]
         feats["pin_match"][i] = 1.0 if p1==p2 and p1 else 0.0
         feats["pin_both_miss"][i] = 1.0 if not p1 and not p2 else 0.0
@@ -409,22 +399,20 @@ def compute_features(s1_ids, sx_ids, s1_lk, sx_lk, name_mat, name_w_mat, addr_ma
     return pd.DataFrame(feats)
 
 
-# Build entity lookups for train
 print("Building entity lookups...")
 t0 = time.time()
 s1_lk = build_entity_lookup(train_s1)
 
-# Filter S2/S3 to only needed entities
 needed_sx = set()
 for cands in train_cands.values(): needed_sx.update(cands)
-sx_combined = pd.concat([train_s2[train_s2["entity_id"].isin(needed_sx)],
-                          train_s3[train_s3["entity_id"].isin(needed_sx)]], ignore_index=True)
-print(f"Filtered SX to {len(sx_combined):,} needed entities")
+if len(needed_sx) > 0:
+    sx_combined = pd.concat([train_s2[train_s2["entity_id"].isin(needed_sx)],
+                              train_s3[train_s3["entity_id"].isin(needed_sx)]], ignore_index=True)
+else:
+    sx_combined = pd.DataFrame(columns=train_s2.columns)
 sx_lk = build_entity_lookup(sx_combined)
 del sx_combined; gc.collect()
-print(f"Lookups built in {time.time()-t0:.1f}s")
 
-# Generate training pairs with negative sampling
 print("Generating training pairs...")
 t0 = time.time()
 import random; random.seed(42)
@@ -446,23 +434,24 @@ for s1_id, cand_ids in train_cands.items():
 
 print(f"Training pairs: {len(pair_s1):,} ({sum(pair_labels):,} pos, {len(pair_labels)-sum(pair_labels):,} neg)")
 
-# Compute features in batches
 BATCH = 100000
 all_feat_dfs = []
 for st in range(0, len(pair_s1), BATCH):
     en = min(st+BATCH, len(pair_s1))
     if st % 500000 == 0:
-        print(f"  Features: {st:,}/{len(pair_s1):,} ({st/len(pair_s1)*100:.0f}%)")
+        print(f"  Features: {st:,}/{len(pair_s1):,} ({st/max(len(pair_s1),1)*100:.0f}%)")
     batch_df = compute_features(pair_s1[st:en], pair_sx[st:en], s1_lk, sx_lk,
                                  train_name_mat, train_name_w_mat, train_addr_mat, train_eid2idx)
     all_feat_dfs.append(batch_df)
 
-feat_df = pd.concat(all_feat_dfs, ignore_index=True)
+if all_feat_dfs:
+    feat_df = pd.concat(all_feat_dfs, ignore_index=True)
+else:
+    feat_df = pd.DataFrame()
 feat_df["s1_id"] = pair_s1; feat_df["sx_id"] = pair_sx; feat_df["label"] = pair_labels
 del all_feat_dfs, pair_s1, pair_sx, pair_labels; gc.collect()
 print(f"Train features: {feat_df.shape} in {time.time()-t0:.1f}s")
 
-# Free train TF-IDF matrices
 del train_name_mat, train_name_w_mat, train_addr_mat, train_eid2idx; gc.collect()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -503,30 +492,24 @@ xgb_params = {
 for fold, (tr_idx, va_idx) in enumerate(gkf.split(X, y, groups=s1_arr)):
     print(f"\n  Fold {fold+1}/5...")
     
-    # Train LightGBM
     dtrain_lgb = lgb.Dataset(X[tr_idx], label=y[tr_idx])
     dval_lgb   = lgb.Dataset(X[va_idx], label=y[va_idx], reference=dtrain_lgb)
     model_lgb = lgb.train(lgb_params, dtrain_lgb, num_boost_round=2000, valid_sets=[dval_lgb],
                            callbacks=[lgb.early_stopping(100, verbose=False)])
     lgb_oof[va_idx] = model_lgb.predict(X[va_idx])
     lgb_best_iters.append(model_lgb.best_iteration)
-    print(f"    LGBM best_iter={model_lgb.best_iteration}")
     
-    # Train XGBoost
     dtrain_xgb = xgb.DMatrix(X[tr_idx], label=y[tr_idx])
     dval_xgb   = xgb.DMatrix(X[va_idx], label=y[va_idx])
     model_xgb = xgb.train(xgb_params, dtrain_xgb, num_boost_round=2000, 
                           evals=[(dval_xgb, 'val')], early_stopping_rounds=100, verbose_eval=False)
     xgb_oof[va_idx] = model_xgb.predict(dval_xgb)
     xgb_best_iters.append(model_xgb.best_iteration)
-    print(f"    XGB  best_iter={model_xgb.best_iteration}")
 
     del dtrain_lgb, dval_lgb, model_lgb, dtrain_xgb, dval_xgb, model_xgb; gc.collect()
 
-# Blend OOF
 val_probas_all = (lgb_oof + xgb_oof) / 2.0
 
-# Find optimal threshold using OOF predictions
 print("\nFinding optimal threshold...")
 s1_to_preds = defaultdict(list)
 for prob, s1, sx in zip(val_probas_all, s1_arr, sx_arr):
@@ -547,13 +530,12 @@ for t in np.arange(0.20, 0.95, 0.02):
             tp = len(true_s & pred_s)
             p = tp/len(pred_s) if pred_s else 0; r = tp/len(true_s) if true_s else 0
             scores.append(fbeta(p, r))
-    f05 = np.mean(scores)
+    f05 = np.mean(scores) if scores else 0.0
     if f05 > best_f05: best_f05 = f05; best_t = t
 
 print(f"  BEST THRESHOLD: {best_t:.3f}")
 print(f"  BEST CV F_0.5:  {best_f05:.4f}")
 
-# Retrain on ALL data
 print("\nRetraining LGBM & XGB on ALL data...")
 full_lgb = lgb.Dataset(X, label=y)
 final_model_lgb = lgb.train(lgb_params, full_lgb, num_boost_round=int(np.mean(lgb_best_iters)))
@@ -563,7 +545,6 @@ final_model_xgb = xgb.train(xgb_params, full_xgb, num_boost_round=int(np.mean(xg
 
 print(f"\nTraining done in {time.time()-t0:.1f}s")
 
-# Free train data
 del feat_df, X, y, s1_arr, sx_arr, val_probas_all, s1_to_preds, full_lgb, full_xgb
 del s1_lk, sx_lk, train_cands
 gc.collect()
@@ -581,9 +562,11 @@ t0 = time.time()
 s1_lk = build_entity_lookup(test_s1)
 needed_sx = set()
 for cands in test_cands.values(): needed_sx.update(cands)
-sx_combined = pd.concat([test_s2[test_s2["entity_id"].isin(needed_sx)],
-                          test_s3[test_s3["entity_id"].isin(needed_sx)]], ignore_index=True)
-print(f"Filtered test SX to {len(sx_combined):,} entities")
+if len(needed_sx) > 0:
+    sx_combined = pd.concat([test_s2[test_s2["entity_id"].isin(needed_sx)],
+                              test_s3[test_s3["entity_id"].isin(needed_sx)]], ignore_index=True)
+else:
+    sx_combined = pd.DataFrame(columns=test_s2.columns)
 sx_lk = build_entity_lookup(sx_combined)
 del sx_combined; gc.collect()
 
@@ -603,13 +586,11 @@ print(f"Total test pairs to score: {len(all_s1):,}")
 BATCH = 100000
 for st in range(0, len(all_s1), BATCH):
     en = min(st+BATCH, len(all_s1))
-    if st % 1000000 == 0:
-        print(f"  {st:,}/{len(all_s1):,} ({st/len(all_s1)*100:.1f}%)")
-    
     batch_feat = compute_features(all_s1[st:en], all_sx[st:en], s1_lk, sx_lk,
                                    test_name_mat, test_name_w_mat, test_addr_mat, test_eid2idx)
     
-    # Ensemble prediction
+    if batch_feat.empty: continue
+    
     X_test = batch_feat[feature_cols].values.astype(np.float32)
     p_lgb = final_model_lgb.predict(X_test)
     p_xgb = final_model_xgb.predict(xgb.DMatrix(X_test))

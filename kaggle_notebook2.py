@@ -10,6 +10,7 @@ Changes for Speed:
 - Reduced candidate blocking limits (Max Cands 150, Neg Ratio 5)
 - Skipped Address TF-IDF blocking
 - Skipped full model retraining (ensembles the 3 CV models directly)
+- [NEW] Bulletproofed against missing columns, empty vocabularies, and OOMs.
 """
 import subprocess, sys
 subprocess.run([sys.executable, "-m", "pip", "install", "rapidfuzz", "-q"], check=True)
@@ -30,7 +31,6 @@ import warnings; warnings.filterwarnings('ignore')
 INPUT_ROOT = Path("/kaggle/input")
 DATA_DIR = None
 
-# Recursively search for the data since Kaggle sometimes nests uploaded folders
 for path in INPUT_ROOT.rglob("train_s1.parquet"):
     DATA_DIR = path.parent
     break
@@ -40,10 +40,10 @@ OUT = Path("/kaggle/working"); OUT.mkdir(exist_ok=True)
 print(f"✅ Data directory: {DATA_DIR}")
 
 # ─── Constants (OPTIMIZED FOR SPEED) ──────────────────────────────────────────
-TFIDF_TOP_K = 50         # Reduced to save time
+TFIDF_TOP_K = 50         
 MAX_BLOCK_SIZE = 5000    
-MAX_CANDIDATES = 150     # Dramatically shrinks feature extraction time
-NEG_RATIO = 5            # Shrinks training data size
+MAX_CANDIDATES = 150     
+NEG_RATIO = 5            
 
 SUFFIXES = frozenset({
     'corporation','incorporated','limited','company','enterprises','industries',
@@ -63,15 +63,15 @@ ABBREVS = {
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 def clean(name):
-    if not name: return ""
+    if not name or not isinstance(name, str): return ""
     return " ".join(t for t in name.split() if t not in SUFFIXES)
 
 def expand(name):
-    if not name: return ""
+    if not name or not isinstance(name, str): return ""
     return " ".join(ABBREVS.get(t, t) for t in name.split())
 
 def ngram_set(s, n=3):
-    if not s or len(s) < n: return frozenset()
+    if not s or not isinstance(s, str) or len(s) < n: return frozenset()
     return frozenset(s[i:i+n] for i in range(len(s)-n+1))
 
 def jaccard(a, b):
@@ -114,10 +114,18 @@ for _, r in train_gt.iterrows():
     gt_dict[s1] = set() if pd.isna(m) or str(m).strip()=="" else set(x.strip() for x in str(m).split(",") if x.strip())
 del train_gt; gc.collect()
 
-# Add expanded/clean names
+# Add expanded/clean names and handle missing columns safely
 for df in [train_s1, train_s2, train_s3, test_s1, test_s2, test_s3]:
-    df["name_norm"] = df["name_norm"].fillna("")
-    df["addr_norm"] = df["addr_norm"].fillna("")
+    for col in ["name_norm", "addr_norm", "country_lower", "pincode", "first_word"]:
+        if col not in df.columns:
+            df[col] = ""
+    
+    df["name_norm"] = df["name_norm"].fillna("").astype(str)
+    df["addr_norm"] = df["addr_norm"].fillna("").astype(str)
+    df["country_lower"] = df["country_lower"].fillna("").astype(str)
+    df["pincode"] = df["pincode"].fillna("").astype(str)
+    df["first_word"] = df["first_word"].fillna("").astype(str)
+    
     df["name_exp"]  = df["name_norm"].apply(expand)
     df["name_cln"]  = df["name_norm"].apply(clean)
 
@@ -129,7 +137,6 @@ print(f"Loaded in {time.time()-t0:.1f}s\n")
 print("="*80); print("SECTION 2: BLOCKING"); print("="*80)
 
 def tfidf_block(s1_df, sx_df, col="name_exp", top_k=TFIDF_TOP_K):
-    """TF-IDF blocking per country."""
     cands = defaultdict(set)
     countries = sorted(set(s1_df["country_lower"].unique()) | set(sx_df["country_lower"].unique()))
     for country in countries:
@@ -148,7 +155,7 @@ def tfidf_block(s1_df, sx_df, col="name_exp", top_k=TFIDF_TOP_K):
             s1_v = normalize(tfidf.transform(s1_vals), norm='l2')
         except ValueError: continue 
         
-        BS = 500  # Reduced to prevent Out-Of-Memory crashes
+        BS = 500  # Micro-chunks to prevent OOM
         for st in range(0, len(s1_ids), BS):
             en = min(st+BS, len(s1_ids))
             sim = (s1_v[st:en] @ sx_v.T).tocsr()
@@ -165,7 +172,6 @@ def tfidf_block(s1_df, sx_df, col="name_exp", top_k=TFIDF_TOP_K):
     return cands
 
 def trad_block(s1_df, sx_df):
-    """Traditional blocking: prefix, firstword, pincode, clean_prefix, rare tokens."""
     cands = defaultdict(set)
     countries = sorted(set(s1_df["country_lower"].unique()) | set(sx_df["country_lower"].unique()))
     for country in countries:
@@ -258,6 +264,12 @@ print(f"\n  🎯 BLOCKING RECALL: {recall:.4f} ({found:,}/{total_true:,})")
 # ══════════════════════════════════════════════════════════════════════════════
 print("\n"+"="*80); print("SECTION 3: TF-IDF FEATURE MATRICES"); print("="*80)
 
+def safe_tfidf(tfidf, texts):
+    try:
+        return normalize(tfidf.fit_transform(texts), norm='l2')
+    except ValueError:
+        return csr_matrix((len(texts), 1), dtype=np.float32)
+
 def build_tfidf_index(s1_df, s2_df, s3_df):
     t0 = time.time()
     all_names = np.concatenate([s1_df["name_exp"].values, s2_df["name_exp"].values, s3_df["name_exp"].values])
@@ -267,15 +279,15 @@ def build_tfidf_index(s1_df, s2_df, s3_df):
     
     name_tfidf = TfidfVectorizer(analyzer='char_wb', ngram_range=(3,4), max_features=80000,
                                   sublinear_tf=True, dtype=np.float32)
-    name_mat = normalize(name_tfidf.fit_transform(all_names), norm='l2')
+    name_mat = safe_tfidf(name_tfidf, all_names)
     
     name_word_tfidf = TfidfVectorizer(analyzer='word', ngram_range=(1,2), max_features=50000,
                                       sublinear_tf=True, dtype=np.float32)
-    name_w_mat = normalize(name_word_tfidf.fit_transform(all_names), norm='l2')
+    name_w_mat = safe_tfidf(name_word_tfidf, all_names)
     
     addr_tfidf = TfidfVectorizer(analyzer='char_wb', ngram_range=(3,4), max_features=50000,
                                   sublinear_tf=True, dtype=np.float32)
-    addr_mat = normalize(addr_tfidf.fit_transform(all_addrs), norm='l2')
+    addr_mat = safe_tfidf(addr_tfidf, all_addrs)
     
     del all_names, all_addrs, all_ids, name_tfidf, name_word_tfidf, addr_tfidf; gc.collect()
     return name_mat, name_w_mat, addr_mat, eid2idx
@@ -291,17 +303,13 @@ def build_entity_lookup(df):
     lookup = {}
     eids = df["entity_id"].values
     norms = df["name_norm"].values; addrs = df["addr_norm"].values
-    pins = df["pincode"].fillna("").values; fws = df["first_word"].fillna("").values
+    pins = df["pincode"].values; fws = df["first_word"].values
     exps = df["name_exp"].values; clns = df["name_cln"].values
     for i in range(len(df)):
-        nm = norms[i] if isinstance(norms[i],str) else ""
-        ad = addrs[i] if isinstance(addrs[i],str) else ""
-        ex = exps[i] if isinstance(exps[i],str) else ""
-        cl = clns[i] if isinstance(clns[i],str) else ""
+        nm = str(norms[i]); ad = str(addrs[i]); ex = str(exps[i]); cl = str(clns[i])
         lookup[eids[i]] = {
-            "name": nm, "addr": ad, "pin": pins[i] if isinstance(pins[i],str) else "",
-            "fw": fws[i] if isinstance(fws[i],str) else "",
-            "exp": ex, "cln": cl, "eid": eids[i],
+            "name": nm, "addr": ad, "pin": str(pins[i]),
+            "fw": str(fws[i]), "exp": ex, "cln": cl, "eid": eids[i],
             "ntok": frozenset(nm.split()) if nm else frozenset(),
             "atok": frozenset(ad.split()) if ad else frozenset(),
             "ctok": frozenset(cl.split()) if cl else frozenset(),
@@ -323,9 +331,10 @@ def compute_features(s1_ids, sx_ids, s1_lk, sx_lk, name_mat, name_w_mat, addr_ma
     
     s1_idx = np.array([eid2idx[eid] for eid in s1_ids])
     sx_idx = np.array([eid2idx[eid] for eid in sx_ids])
-    feats["name_tfidf"] = np.array(name_mat[s1_idx].multiply(name_mat[sx_idx]).sum(axis=1)).flatten()
-    feats["name_w_tfidf"] = np.array(name_w_mat[s1_idx].multiply(name_w_mat[sx_idx]).sum(axis=1)).flatten()
-    feats["addr_tfidf"] = np.array(addr_mat[s1_idx].multiply(addr_mat[sx_idx]).sum(axis=1)).flatten()
+    
+    if name_mat.shape[1] > 1: feats["name_tfidf"] = np.array(name_mat[s1_idx].multiply(name_mat[sx_idx]).sum(axis=1)).flatten()
+    if name_w_mat.shape[1] > 1: feats["name_w_tfidf"] = np.array(name_w_mat[s1_idx].multiply(name_w_mat[sx_idx]).sum(axis=1)).flatten()
+    if addr_mat.shape[1] > 1: feats["addr_tfidf"] = np.array(addr_mat[s1_idx].multiply(addr_mat[sx_idx]).sum(axis=1)).flatten()
     
     for i in range(n):
         s1 = s1_lk[s1_ids[i]]; sx = sx_lk[sx_ids[i]]
@@ -388,8 +397,11 @@ s1_lk = build_entity_lookup(train_s1)
 
 needed_sx = set()
 for cands in train_cands.values(): needed_sx.update(cands)
-sx_combined = pd.concat([train_s2[train_s2["entity_id"].isin(needed_sx)],
-                          train_s3[train_s3["entity_id"].isin(needed_sx)]], ignore_index=True)
+if len(needed_sx) > 0:
+    sx_combined = pd.concat([train_s2[train_s2["entity_id"].isin(needed_sx)],
+                              train_s3[train_s3["entity_id"].isin(needed_sx)]], ignore_index=True)
+else:
+    sx_combined = pd.DataFrame(columns=train_s2.columns)
 sx_lk = build_entity_lookup(sx_combined)
 del sx_combined; gc.collect()
 
@@ -422,7 +434,10 @@ for st in range(0, len(pair_s1), BATCH):
                                  train_name_mat, train_name_w_mat, train_addr_mat, train_eid2idx)
     all_feat_dfs.append(batch_df)
 
-feat_df = pd.concat(all_feat_dfs, ignore_index=True)
+if all_feat_dfs:
+    feat_df = pd.concat(all_feat_dfs, ignore_index=True)
+else:
+    feat_df = pd.DataFrame()
 feat_df["s1_id"] = pair_s1; feat_df["sx_id"] = pair_sx; feat_df["label"] = pair_labels
 del all_feat_dfs, pair_s1, pair_sx, pair_labels; gc.collect()
 print(f"Train features: {feat_df.shape} in {time.time()-t0:.1f}s")
@@ -486,7 +501,7 @@ for t in np.arange(0.20, 0.95, 0.02):
             tp = len(true_s & pred_s)
             p = tp/len(pred_s) if pred_s else 0; r = tp/len(true_s) if true_s else 0
             scores.append(fbeta(p, r))
-    f05 = np.mean(scores)
+    f05 = np.mean(scores) if scores else 0.0
     if f05 > best_f05: best_f05 = f05; best_t = t
 
 print(f"\n  BEST THRESHOLD: {best_t:.3f}")
@@ -507,8 +522,11 @@ test_name_mat, test_name_w_mat, test_addr_mat, test_eid2idx = build_tfidf_index(
 s1_lk = build_entity_lookup(test_s1)
 needed_sx = set()
 for cands in test_cands.values(): needed_sx.update(cands)
-sx_combined = pd.concat([test_s2[test_s2["entity_id"].isin(needed_sx)],
-                          test_s3[test_s3["entity_id"].isin(needed_sx)]], ignore_index=True)
+if len(needed_sx) > 0:
+    sx_combined = pd.concat([test_s2[test_s2["entity_id"].isin(needed_sx)],
+                              test_s3[test_s3["entity_id"].isin(needed_sx)]], ignore_index=True)
+else:
+    sx_combined = pd.DataFrame(columns=test_s2.columns)
 sx_lk = build_entity_lookup(sx_combined)
 del sx_combined; gc.collect()
 
@@ -527,9 +545,10 @@ for st in range(0, len(all_s1), BATCH):
     batch_feat = compute_features(all_s1[st:en], all_sx[st:en], s1_lk, sx_lk,
                                    test_name_mat, test_name_w_mat, test_addr_mat, test_eid2idx)
     
+    if batch_feat.empty: continue
+
     X_test = batch_feat[feature_cols].values.astype(np.float32)
     
-    # Ensemble over the 3 CV models
     proba = np.zeros(len(X_test), dtype=np.float32)
     for model in models:
         proba += model.predict(X_test)
